@@ -1,0 +1,4 @@
+interface:
+  display_name: "京喜自营批量邀约"
+  short_description: "后台邀请本人名下京喜自营 SPU，支持上万条分页、断点续跑与全量核验"
+  default_prompt: "使用 $jd-jx-self-operated-invite，把我名下看板中的全部 SPU 邀请升级京喜自营，后台静默执行。"
