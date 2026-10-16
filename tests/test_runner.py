@@ -17,16 +17,19 @@ class FakePlatform:
         self.rows=[{'spuId':str(100000+i),'venderId':str(700+i%17),'shopId':str(900+i%17),
                     'erp':erp,'canOperate':True,'productName':'synthetic','shopName':'synthetic'} for i in range(count)]
         self.sent=[];self.active=set();self.failed=set();self.hidden=set();self.lose_response=False;self.corrupt_identity=False
+        self.board={r['spuId'] for r in self.rows};self.remove_on_invite=True;self.later_stage=set()
 
     def call(self,q):
         if q.get('expectedErp',self.erp)!=self.erp:raise RuntimeError('identity changed')
         if q['op']=='identity':return {'erp':self.erp,'role':4}
         if q['op']=='capture':return {'erp':self.erp,'query':{'accessContext':{},'queryParam':{'dataSource':2,'pageNum':1,'pageSize':100,'lastCategoryIdList':['1'],'dept3IdList':['2']}},'total':len(self.rows)}
-        if q['op']=='pages':return [{'pageNum':n,'total':len(self.rows),'rows':self.rows[(n-1)*100:n*100],'trace':'synthetic'} for n in q['pages']]
+        if q['op']=='pages':
+            shown=[r for r in self.rows if r['spuId'] in self.board]
+            return [{'pageNum':n,'total':len(shown),'rows':shown[(n-1)*100:n*100],'trace':'synthetic'} for n in q['pages']]
         if q['op']=='records':
             result=[]
             for ids in q['groups']:
-                rows=[{k:r[k] for k in ('spuId','venderId','shopId')} for r in self.rows if r['spuId'] in ids and r['spuId'] in self.active and r['spuId'] not in self.hidden]
+                rows=[{k:r[k] for k in ('spuId','venderId','shopId')} for r in self.rows if r['spuId'] in ids and r['spuId'] in self.active and r['spuId'] not in self.hidden and (r['spuId'] not in self.later_stage or q['statuses']!=[40,99])]
                 if self.corrupt_identity and rows:rows[0]['shopId']='99999'
                 result.append({'rows':rows,'trace':'synthetic','statuses':q['statuses'],'verifiedAt':'synthetic'})
             return result
@@ -35,10 +38,18 @@ class FakePlatform:
             for group in q['groups']:
                 assert 1<=len(group)<=100
                 result=[]
+                mixed=len(group)>1 and any(sid in self.later_stage for sid,_,_ in group)
                 for sid,vender,shop in group:
-                    if sid in self.sent:raise AssertionError('Duplicate invitation')
+                    if sid in self.later_stage:
+                        result.append({'spuId':sid,'state':'inflow','code':201,'msg':'already in later flow'})
+                        continue
+                    if mixed:
+                        result.append({'spuId':sid,'state':'pending','code':201,'msg':'batch rejected; retry'})
+                        continue
+                    if sid in self.sent and sid not in self.board:raise AssertionError('Duplicate invitation')
                     self.sent.append(sid)
                     if sid not in self.failed:self.active.add(sid)
+                    if self.remove_on_invite:self.board.discard(sid)
                     result.append({'spuId':sid,'state':'rejected' if sid in self.failed else 'accepted','code':410 if sid in self.failed else 200,'msg':'synthetic'})
                 results.append({'items':result,'stop':False,'trace':'synthetic'})
             if self.lose_response:self.lose_response=False;raise RuntimeError('CLI response lost after all writes committed')
@@ -133,5 +144,30 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'credential'):
             runner.prepare(p,self.directory,query={'queryParam':{'dataSource':2,'token':'synthetic-secret'}})
         self.assertFalse((self.directory/'snapshot.json').exists());self.assertFalse(p.sent)
+
+    def test_resend_reinvites_only_board_listed_pending_upgrade_items(self):
+        p=FakePlatform(12);s,t=self.prepare(p)
+        result=runner.run(p,self.directory,s,t)
+        self.assertTrue(result['complete']);self.assertEqual(len(p.sent),12);self.assertEqual(p.board,set())
+        relisted={r['spuId'] for r in p.rows[:5]};p.board |= relisted
+        s,t=runner.load_task(self.directory)
+        self.assertTrue(all(t['items'][sid]['state']=='verified' for sid in relisted))
+        result=runner.run(p,self.directory,s,t,resend=True)
+        self.assertEqual(result['resent'],5);self.assertEqual(len(p.sent),17);self.assertTrue(result['complete'])
+        self.assertEqual(result['board']['total'],0)
+
+    def test_resend_off_keeps_dedupe(self):
+        p=FakePlatform(9);s,t=self.prepare(p)
+        runner.run(p,self.directory,s,t);p.board |= {r['spuId'] for r in p.rows[:3]}
+        result=runner.run(p,self.directory,*runner.load_task(self.directory))
+        self.assertEqual(len(p.sent),9);self.assertEqual(result['resent'],0)
+
+    def test_inflow_rejection_retries_and_marks_existing(self):
+        p=FakePlatform(9);s,t=self.prepare(p)
+        p.later_stage={r['spuId'] for r in p.rows[:2]};p.active |= p.later_stage
+        result=runner.run(p,self.directory,s,t)
+        self.assertEqual(result['counts'].get('existing'),2)
+        self.assertEqual(len(p.sent),7);self.assertFalse(p.later_stage & set(p.sent))
+        self.assertTrue(result['complete'])
 
 if __name__=='__main__':unittest.main()

@@ -146,6 +146,15 @@ const JXInvite = (() => {
           results.push({items: params.map(r=>({spuId:r.spuId,state:'unknown',msg:'Response unavailable; reconcile first'})), stop:true});
           break;
         }
+        const msg = String(b.msg ?? '');
+        if (!valid(b) && msg.includes('已在升级流程中')) {
+          const listed = new Set((msg.match(/\d{10,}/g) || []));
+          results.push({items: params.map(r => listed.has(r.spuId)
+            ? {spuId:r.spuId, state:'inflow', code:b.code, msg:'Platform: already in later upgrade flow'}
+            : {spuId:r.spuId, state:'pending', code:b.code, msg:'Batch rejected; retry remaining items'}),
+            code:b.code, bCode:b.bCode, trace:text(b['dsm-trace-id']), stop:false, finished:new Date().toISOString()});
+          continue;
+        }
         results.push({items: classify(b, params.map(r=>r.spuId)), code:b.code, bCode:b.bCode,
           trace:text(b['dsm-trace-id']), stop:!valid(b), finished:new Date().toISOString()});
         if (!valid(b)) break;

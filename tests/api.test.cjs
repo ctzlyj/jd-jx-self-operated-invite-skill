@@ -78,3 +78,15 @@ test('invitations only run on the Jingxi task page and source=2',async()=>{
   global.location.href='https://osw.jd.com/cz/bundling/pop2Self/other';
   await assert.rejects(api.dispatch({op:'identity'}),/Jingxi OSW page/);
 });
+
+test('later-flow batch rejection maps listed and unlisted items',async()=>{
+  let writes=0;
+  environment((name,payload)=>{
+    assert.ok(name.endsWith('batchInviteWareConvert'));writes++;
+    const ids=payload.batchInviteWareParam.inviteSpuParams.map(r=>r.spuId);
+    return {code:201,bCode:'500',msg:'x\u5df2\u5728\u5347\u7ea7\u6d41\u7a0b\u4e2d['+ids.slice(0,2).join(',')+']'};
+  });
+  const result=await api.dispatch({op:'invite',expectedErp:'employee-a',groups:[[['111222333444','7','8'],['111222333445','7','8'],['111222333446','7','8']]]});
+  assert.equal(writes,1);assert.equal(result[0].stop,false);
+  assert.deepEqual(result[0].items.map(x=>x.state),['inflow','inflow','pending']);
+});

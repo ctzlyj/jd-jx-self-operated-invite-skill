@@ -8,7 +8,7 @@ Python 3.10+，无需第三方 Python 包。复用安装好的 WebCLI/Browser Br
 
 任务目录至少包含 `snapshot.json`、`state.json`、`result.json`、`result.csv`、`failures.csv`。这些都是本机业务资料，不随 Skill 分发。准备阶段读取页面真实过滤器；总数变化、页码不符、短页、重复 SPU、ERP 不匹配时拒绝提交不完整范围。
 
-正常：`prepare` → `run --apply` → `verify`。`run` 自动先对账，再写未提交项，最后全量回查并输出结果。`verify` 不发邀请；`status` 不访问线上。已有明确失败不会在普通续跑中重复提交；用户要求重试失败时加 `run --apply --retry-failed`。即使重试失败也先回查。
+正常：`prepare` → `run --apply` → `verify`。`run` 自动先对账，再写未提交项，最后全量回查并输出结果。`verify` 不发邀请；`status` 不访问线上。已有明确失败不会在普通续跑中重复提交；用户要求重试失败时加 `run --apply --retry-failed`。用户要求看板清零时加 `run --apply --resend`，只重发仍显示在看板上的待升级（40/99）商品。即使重试或重发也先回查。
 
 写入前先持久化 `submitting`。宕机、超时或空回执后保留未知状态；续跑先从升级记录核对，未获得可靠结果的未知项继续保留，不再提交。其他明确未提交项可继续。登录失效、账号改变或整批平台权限错误停止后续写入；单项商品业务失败继续其他项。
 

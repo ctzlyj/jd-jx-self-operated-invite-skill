@@ -66,7 +66,7 @@ class Client:
 
     def call(self, request):
         cmd = self.command(request)
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=55, shell=False)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=90, shell=False)
         if p.returncode:
             # Never print raw CLI diagnostics that may contain a request/header dump.
             raise RuntimeError('Browser operation failed; inspect login/connection and reconcile before retrying')
@@ -155,6 +155,17 @@ def load_task(directory):
         raise RuntimeError('Snapshot/state scope mismatch')
     return snapshot, state
 
+def board_ids(client, snapshot, group_size=4):
+    """IDs still listed on the current selection pool, using the frozen task scope query."""
+    first = client.call({'op': 'pages', 'expectedErp': snapshot['erp'], 'query': snapshot['query'], 'pages': [1]})[0]
+    total = first['total']
+    ids = {r['spuId'] for r in first['rows']}
+    if total > len(ids):
+        for nums in chunks(list(range(2, (total+99)//100+1)), group_size):
+            for page in client.call({'op': 'pages', 'expectedErp': snapshot['erp'], 'query': snapshot['query'], 'pages': nums}):
+                ids |= {r['spuId'] for r in page['rows']}
+    return ids
+
 def reconcile(client, directory, snapshot, state, group_size=4):
     originals = {r['spuId']: r for r in snapshot['rows']}
     remaining = []
@@ -189,7 +200,7 @@ def reconcile(client, directory, snapshot, state, group_size=4):
         write(directory/'state.json', state)
     confirmed = {sid for p in proofs for sid in p['ids']}
     for sid, row in state['items'].items():
-        if sid not in confirmed and row['state'] in ('submitting', 'accepted', 'verified', 'existing'):
+        if sid not in confirmed and row['state'] in ('submitting', 'verified', 'existing'):
             row['state'] = 'unknown'
     state['verification'] = {'checkedAt': time.time(), 'count': len(confirmed), 'proofs': proofs}
     write(directory/'state.json', state)
@@ -198,8 +209,9 @@ def reconcile(client, directory, snapshot, state, group_size=4):
 def report(directory, snapshot, state, board=None):
     counts = dict(collections.Counter(r['state'] for r in state['items'].values()))
     result = {'erp': snapshot['erp'], 'originalSpus': snapshot['total'], 'counts': counts,
+              'resent': sum(1 for x in state['items'].values() if x.get('resendCount')),
               'verifiedSpus': state.get('verification', {}).get('count', 0),
-              'complete': state.get('verification', {}).get('count', -1) == snapshot['total'],
+              'complete': not any(x['state'] in ('pending','submitting','unknown','rejected') for x in state['items'].values()),
               'board': board, 'batches': len(state['batches'])}
     write(directory/'result.json', result)
     fields = ['spuId','venderId','shopId','erp','shopName','productName','state','message']
@@ -211,10 +223,14 @@ def report(directory, snapshot, state, board=None):
     emit(result)
     return result
 
-def run(client, directory, snapshot, state, retry_failed=False, group_size=4):
+def run(client, directory, snapshot, state, retry_failed=False, resend=False, group_size=4):
     reconcile(client,directory,snapshot,state,group_size)
+    resend_ids = set()
+    if resend:
+        resend_ids = {sid for sid in board_ids(client, snapshot, group_size)
+                      if state['items'].get(sid, {}).get('state') == 'verified'}
     rows = [r for r in snapshot['rows'] if state['items'][r['spuId']]['state']=='pending' or
-            (retry_failed and state['items'][r['spuId']]['state']=='rejected')]
+            (retry_failed and state['items'][r['spuId']]['state']=='rejected') or r['spuId'] in resend_ids]
     eligible=[]
     for r in rows:
         if r['canOperate']: eligible.append(r)
@@ -224,6 +240,8 @@ def run(client, directory, snapshot, state, retry_failed=False, group_size=4):
         request={'op':'invite','expectedErp':snapshot['erp'],'groups':[[[r['spuId'],r['venderId'],r['shopId']] for r in g] for g in groups]}
         if hasattr(client,'preflight'): client.preflight(request)
         for r in sum(groups,[]): state['items'][r['spuId']].update(state='submitting',submittedAt=time.time())
+        for r in sum(groups,[]):
+            if r['spuId'] in resend_ids: state['items'][r['spuId']]['resendCount'] = state['items'][r['spuId']].get('resendCount',0)+1
         write(directory/'state.json',state)
         try:
             results=client.call(request)
@@ -234,9 +252,15 @@ def run(client, directory, snapshot, state, retry_failed=False, group_size=4):
                 items=receipt.get('items',[])
                 if {x['spuId'] for x in items}!=wanted or len(items)!=len(wanted): raise RuntimeError('Receipt IDs incomplete')
                 for item in items:
-                    if item['state'] not in ('accepted','rejected','unknown'): raise RuntimeError('Invalid receipt state')
-                    state['items'][item['spuId']].update(item)
-                    returned_ids.add(item['spuId'])
+                    if item['state'] not in ('accepted','rejected','unknown','inflow','pending'): raise RuntimeError('Invalid receipt state')
+                    if item['state']=='inflow':
+                        state['items'][item['spuId']].update(state='existing',msg='Platform: already in later upgrade flow; pool clears on refresh')
+                        returned_ids.add(item['spuId'])
+                    elif item['state']=='pending':
+                        pass
+                    else:
+                        state['items'][item['spuId']].update(item)
+                        returned_ids.add(item['spuId'])
                 state['batches'].append(receipt)
             for r in sum(groups,[]):
                 if r['spuId'] not in returned_ids: state['items'][r['spuId']]['state']='pending'
@@ -250,6 +274,36 @@ def run(client, directory, snapshot, state, retry_failed=False, group_size=4):
             write(directory/'state.json',state)
             # Abort further writes if browser/account status cannot be established.
             raise
+    # Retry items whose batch was rejected only because it mixed in later-flow SPUs.
+    if not any(x['state']=='unknown' for x in state['items'].values()):
+        for r in [r for r in snapshot['rows'] if state['items'][r['spuId']]['state']=='pending']:
+            row=state['items'][r['spuId']]
+            if row.get('retryCount',0)>=1:
+                row.update(state='rejected',msg='Retry did not clear; reconcile remote state'); continue
+            row['retryCount']=row.get('retryCount',0)+1
+            request={'op':'invite','expectedErp':snapshot['erp'],'groups':[[[r['spuId'],r['venderId'],r['shopId']]]]}
+            if hasattr(client,'preflight'): client.preflight(request)
+            row.update(state='submitting',submittedAt=time.time())
+            if r['spuId'] in resend_ids: row['resendCount']=row.get('resendCount',0)+1
+            write(directory/'state.json',state)
+            try:
+                receipt=client.call(request)
+                if not isinstance(receipt,list) or len(receipt)!=1: raise RuntimeError('Invalid single receipt')
+                item=receipt[0].get('items',[{}])[0]
+                if item.get('spuId')!=r['spuId'] or item.get('state') not in ('accepted','rejected','unknown','inflow','pending'): raise RuntimeError('Invalid single receipt')
+                if item['state']=='inflow':
+                    row.update(state='existing',msg='Platform: already in later upgrade flow; pool clears on refresh')
+                elif item['state']=='pending':
+                    row['state']='pending'
+                else:
+                    row.update(item)
+                state['batches'].append(receipt[0])
+                write(directory/'state.json',state)
+                emit({'phase':'inviting','processed':sum(x['state']!='pending' for x in state['items'].values()),'total':snapshot['total']})
+            except Exception:
+                if row['state']=='submitting': row.update(state='unknown',msg='Response unavailable; reconciliation required')
+                write(directory/'state.json',state)
+                raise
     reconcile(client,directory,snapshot,state,group_size)
     board=client.call({'op':'board','expectedErp':snapshot['erp'],'query':snapshot['query']})
     return report(directory,snapshot,state,board)
@@ -259,7 +313,7 @@ def main():
     p.add_argument('action',choices=['prepare','run','verify','status'])
     p.add_argument('--state-dir',required=True);p.add_argument('--session');p.add_argument('--tab')
     p.add_argument('--profile');p.add_argument('--launcher-json');p.add_argument('--expected-count',type=int)
-    p.add_argument('--query-file');p.add_argument('--apply',action='store_true');p.add_argument('--retry-failed',action='store_true')
+    p.add_argument('--query-file');p.add_argument('--apply',action='store_true');p.add_argument('--retry-failed',action='store_true');p.add_argument('--resend',action='store_true')
     p.add_argument('--group-size',type=int,choices=range(1,5),default=4)
     a=p.parse_args();directory=Path(a.state_dir).expanduser().resolve()
     if directory==ROOT or ROOT in directory.parents: p.error('Task data must stay outside the public Skill folder')
@@ -271,7 +325,7 @@ def main():
         client=Client(a.session,a.tab,a.launcher_json,a.profile)
         if a.action=='prepare':prepare(client,directory,a.expected_count,read(a.query_file) if a.query_file else None,a.group_size);return 0
         s,t=load_task(directory)
-        if a.action=='run':result=run(client,directory,s,t,a.retry_failed,a.group_size)
+        if a.action=='run':result=run(client,directory,s,t,a.retry_failed,a.resend,a.group_size)
         else:
             reconcile(client,directory,s,t,a.group_size)
             board=client.call({'op':'board','expectedErp':s['erp'],'query':s['query']})
