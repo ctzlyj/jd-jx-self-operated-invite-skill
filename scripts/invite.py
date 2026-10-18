@@ -228,7 +228,7 @@ def run(client, directory, snapshot, state, retry_failed=False, resend=False, gr
     resend_ids = set()
     if resend:
         resend_ids = {sid for sid in board_ids(client, snapshot, group_size)
-                      if state['items'].get(sid, {}).get('state') == 'verified'}
+                      if sid in state['items']}
     rows = [r for r in snapshot['rows'] if state['items'][r['spuId']]['state']=='pending' or
             (retry_failed and state['items'][r['spuId']]['state']=='rejected') or r['spuId'] in resend_ids]
     eligible=[]
@@ -236,7 +236,7 @@ def run(client, directory, snapshot, state, retry_failed=False, resend=False, gr
         if r['canOperate']: eligible.append(r)
         else: state['items'][r['spuId']].update(state='rejected',msg='Current board item is not operable')
     write(directory/'state.json',state)
-    for groups in chunks(chunks(eligible,100),group_size):
+    for groups in chunks(chunks(eligible,10 if resend else 100),group_size):
         request={'op':'invite','expectedErp':snapshot['erp'],'groups':[[[r['spuId'],r['venderId'],r['shopId']] for r in g] for g in groups]}
         if hasattr(client,'preflight'): client.preflight(request)
         for r in sum(groups,[]): state['items'][r['spuId']].update(state='submitting',submittedAt=time.time())

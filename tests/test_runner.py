@@ -17,7 +17,7 @@ class FakePlatform:
         self.rows=[{'spuId':str(100000+i),'venderId':str(700+i%17),'shopId':str(900+i%17),
                     'erp':erp,'canOperate':True,'productName':'synthetic','shopName':'synthetic'} for i in range(count)]
         self.sent=[];self.active=set();self.failed=set();self.hidden=set();self.lose_response=False;self.corrupt_identity=False
-        self.board={r['spuId'] for r in self.rows};self.remove_on_invite=True;self.later_stage=set()
+        self.board={r['spuId'] for r in self.rows};self.remove_on_invite=True;self.later_stage=set();self.record_later=set()
 
     def call(self,q):
         if q.get('expectedErp',self.erp)!=self.erp:raise RuntimeError('identity changed')
@@ -29,7 +29,7 @@ class FakePlatform:
         if q['op']=='records':
             result=[]
             for ids in q['groups']:
-                rows=[{k:r[k] for k in ('spuId','venderId','shopId')} for r in self.rows if r['spuId'] in ids and r['spuId'] in self.active and r['spuId'] not in self.hidden and (r['spuId'] not in self.later_stage or q['statuses']!=[40,99])]
+                rows=[{k:r[k] for k in ('spuId','venderId','shopId')} for r in self.rows if r['spuId'] in ids and r['spuId'] in self.active and r['spuId'] not in self.hidden and (r['spuId'] not in self.later_stage and r['spuId'] not in self.record_later or q['statuses']!=[40,99])]
                 if self.corrupt_identity and rows:rows[0]['shopId']='99999'
                 result.append({'rows':rows,'trace':'synthetic','statuses':q['statuses'],'verifiedAt':'synthetic'})
             return result
@@ -161,6 +161,17 @@ class RunnerTests(unittest.TestCase):
         runner.run(p,self.directory,s,t);p.board |= {r['spuId'] for r in p.rows[:3]}
         result=runner.run(p,self.directory,*runner.load_task(self.directory))
         self.assertEqual(len(p.sent),9);self.assertEqual(result['resent'],0)
+
+    def test_resend_retries_existing_classified_board_items(self):
+        p=FakePlatform(9);s,t=self.prepare(p)
+        runner.run(p,self.directory,s,t)
+        p.record_later={r['spuId'] for r in p.rows[:3]};p.active |= p.record_later
+        p.board |= p.record_later
+        s,t=runner.load_task(self.directory)
+        self.assertTrue(all(t['items'][sid]['state']=='verified' for sid in p.record_later))
+        result=runner.run(p,self.directory,s,t,resend=True)
+        self.assertEqual(result['resent'],3);self.assertEqual(result['board']['total'],0)
+        self.assertTrue(result['complete'])
 
     def test_inflow_rejection_retries_and_marks_existing(self):
         p=FakePlatform(9);s,t=self.prepare(p)
