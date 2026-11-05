@@ -2,7 +2,15 @@
 
 Python 3.10+，无需第三方 Python 包。复用安装好的 WebCLI/Browser Bridge 与本人的 OSW 登录；浏览器仅处理任务专属后台页。未安装工具时由助手按本机 O2 指南安装、检查，不要求同事学习命令。
 
-脚本默认发现 O2。在 Windows 有本机 O2 `scripts/windows_launch.py` 时自动使用其显式 UTF-8/stdio 路由；缺少该覆盖层或使用其他运行环境时，可通过 `--launcher-json` 传入已验证的命令数组。例如 `['python','/实际路径/toolbox.py','run','webcli','--']` 的 **JSON 双引号形式**，或者已核对的 Node + WebCLI main.js 路径。该数组只是 CLI 前缀，脚本自动追加 `browser <session> eval <JS> --tab <id>`。
+## 首次自检（doctor）
+
+```text
+python scripts/invite.py doctor
+```
+
+逐项检查并输出 JSON：Python 版本（`python`）、O2 命令（`o2`）、WebCLI/浏览器桥接（`webcli`）、任务目录可写性（`task-dir`，默认 `~/jx-invite-tasks`，可用 `--state-dir` 指定）、ERP 登录（`erp-login`）。浏览器检查自动开任务专属后台标签 `https://osw.jd.com/cz/bundling/pop2Self/jxCenter`，读取真实登录接口中的 ERP 后立即释放标签，不触碰工作浏览器。全部 `ok: true` 才继续 prepare；任何失败项的 `next` 字段给出采销可直接照做的下一步（含缺 O2 时的 pip 安装命令）。
+
+脚本默认发现 O2。在 Windows 依次在 `~/.joycode/skills`、`~/.codex/skills`、`~/.agents/skills`、`~/.claude/skills` 下查找 O2 Skill 的 `scripts/windows_launch.py`（目录名 `o2`，或 `skill-<id>` 目录中 SKILL.md frontmatter `name: o2`），找到且同环境有 `python.exe` 时自动使用其显式 UTF-8/stdio 路由；**找不到时直接使用 `o2 launch webcli` 命令**，不依赖任何特定安装位置。O2 命令本身缺失时给出 pip 安装提示并停止。需要覆盖自动发现时，可通过 `--launcher-json` 传入已验证的命令数组。例如 `['python','/实际路径/toolbox.py','run','webcli','--']` 的 **JSON 双引号形式**，或者已核对的 Node + WebCLI main.js 路径。该数组只是 CLI 前缀，脚本自动追加 `browser <session> eval <JS> --tab <id>`。
 
 不要把 Cookie、Token、设备参数放进前缀或查询 JSON。任何 CLI 空输出都不是成功回执；写入结果按未知处理，再回查，禁止因更换前缀重放。脚本不启用 shell，不通过 `cmd /c` 拼接 JavaScript；UTF-8 与中文按 argv 保留。
 

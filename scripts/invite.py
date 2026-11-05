@@ -6,12 +6,16 @@ import csv
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+PAGE_URL = 'https://osw.jd.com/cz/bundling/pop2Self/jxCenter'
+O2_INSTALL_CMD = 'pip install -U --index-url https://artifactory.jd.com/artifactory/api/pypi/libs-py-local/simple o2'
+AGENT_SKILL_ROOTS = ('.joycode/skills', '.codex/skills', '.agents/skills', '.claude/skills')
 ALL_STATES = [30, 40, 99, 71, 72, 80, 90]
 LABELS = {'pending': '未提交', 'submitting': '提交中', 'accepted': '接口成功待回查',
           'rejected': '业务失败', 'unknown': '结果未知', 'verified': '已邀约待升级', 'existing': '已有升级流程'}
@@ -31,7 +35,108 @@ def write(path, data):
 def emit(data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
-def launcher(override=None):
+def check_python():
+    ok = sys.version_info >= (3, 10)
+    return {'check': 'python', 'ok': ok,
+            'detail': f'Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}（仅标准库，无第三方依赖）',
+            'next': '' if ok else '安装 Python 3.10+ 后重跑自检'}
+
+def check_webcli(prefix, session):
+    try:
+        p = subprocess.run(prefix + ['browser', session, 'tab', 'list'], capture_output=True,
+                           text=True, encoding='utf-8', timeout=30, shell=False)
+    except (subprocess.SubprocessError, OSError):
+        p = None
+    if p is None or p.returncode or not p.stdout.strip():
+        return {'check': 'webcli', 'ok': False, 'detail': 'WebCLI 不可用',
+                'next': '运行 o2 install webcli 安装后重跑自检；已安装则按 o2 skill webcli 排查浏览器桥接'}
+    try:
+        json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {'check': 'webcli', 'ok': False, 'detail': 'WebCLI 响应异常',
+                'next': '运行 o2 install webcli 安装（或按 o2 skill webcli 排查）后重跑自检'}
+    return {'check': 'webcli', 'ok': True, 'detail': 'WebCLI/浏览器可用', 'next': ''}
+
+def check_task_dir(directory):
+    directory, probe = Path(directory), Path(directory)/'.doctor-probe'
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe.write_text('ok', encoding='utf-8')
+        probe.unlink()
+    except OSError:
+        return {'check': 'task-dir', 'ok': False, 'detail': f'任务目录不可写：{directory}',
+                'next': '换一个可写目录（如用户主目录下 jx-invite-tasks）后重跑自检'}
+    return {'check': 'task-dir', 'ok': True, 'detail': f'任务目录可写：{directory}', 'next': ''}
+
+def check_login(prefix, session):
+    try:
+        p = subprocess.run(prefix + ['browser', session, '--window', 'background', 'open', PAGE_URL],
+                           capture_output=True, text=True, encoding='utf-8', timeout=60, shell=False)
+        page = json.loads(p.stdout).get('page') if p.returncode == 0 and p.stdout.strip() else None
+        if not page:
+            return {'check': 'erp-login', 'ok': False, 'detail': '后台任务页打开失败',
+                    'next': '确认 WebCLI 浏览器桥接可用（o2 skill webcli）后重跑自检'}
+        try:
+            client = Client(session, page, prefix=prefix)
+            erp = client.call({'op': 'identity'}).get('erp')
+            if not erp:
+                raise RuntimeError('ERP identity empty')
+            return {'check': 'erp-login', 'ok': True, 'detail': f'ERP {erp} 已登录（后台任务页已释放）', 'next': ''}
+        finally:
+            with contextlib.suppress(Exception):
+                subprocess.run(prefix + ['browser', session, 'close'], capture_output=True,
+                               text=True, encoding='utf-8', timeout=30, shell=False)
+    except Exception:
+        return {'check': 'erp-login', 'ok': False, 'detail': '未能确认 ERP 登录身份',
+                'next': '请先在浏览器完成京东 ERP 登录（正常打开一次 https://osw.jd.com）后重跑自检'}
+
+def doctor(args):
+    session, state_dir, launcher_json = (getattr(args, 'session', None) or 'jx-doctor',
+                                         getattr(args, 'state_dir', None), getattr(args, 'launcher_json', None))
+    checks = [check_python()]
+    prefix = None
+    try:
+        prefix = launcher(launcher_json)
+        mode = 'Windows 兼容层 windows_launch.py' if any('windows_launch.py' in x for x in prefix) else 'o2 launch webcli'
+        checks.append({'check': 'o2', 'ok': True, 'detail': f'O2 可用（{mode}）', 'next': ''})
+    except (RuntimeError, ValueError) as e:
+        checks.append({'check': 'o2', 'ok': False, 'detail': str(e), 'next': O2_INSTALL_CMD})
+        checks.append({'check': 'webcli', 'ok': False, 'detail': '跳过：O2 不可用', 'next': '先安装 O2'})
+        checks.append({'check': 'erp-login', 'ok': False, 'detail': '跳过：O2 不可用', 'next': '先安装 O2'})
+    if prefix:
+        checks.append(check_webcli(prefix, session))
+    checks.append(check_task_dir(Path(state_dir).expanduser() if state_dir else Path.home()/'jx-invite-tasks'))
+    if prefix:
+        checks.append(check_login(prefix, session))
+    ok = all(c['ok'] for c in checks)
+    emit({'phase': 'doctor', 'ok': ok, 'checks': checks})
+    return 0 if ok else 1
+
+def _frontmatter_name(path):
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')[:2000]
+    except OSError:
+        return None
+    m = re.search(r'^name:\s*(\S+)', text, re.M)
+    return m.group(1) if m else None
+
+def find_o2_helper(home=None):
+    """Locate the O2 Skill's windows_launch.py across common agent skill roots."""
+    home = Path(home) if home else Path.home()
+    for rel in AGENT_SKILL_ROOTS:
+        root = home/rel
+        if not root.is_dir():
+            continue
+        direct = root/'o2'/'scripts'/'windows_launch.py'
+        if direct.is_file():
+            return direct
+        for skill_dir in sorted(root.glob('skill-*')):
+            helper = skill_dir/'scripts'/'windows_launch.py'
+            if helper.is_file() and _frontmatter_name(skill_dir/'SKILL.md') == 'o2':
+                return helper
+    return None
+
+def launcher(override=None, home=None):
     if override:
         cmd = json.loads(override)
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
@@ -39,18 +144,19 @@ def launcher(override=None):
         return cmd
     exe = shutil.which('o2')
     if not exe:
-        raise RuntimeError('O2 not found; use the installed browser router and --launcher-json')
-    helper = Path.home()/'.joycode/skills/o2/scripts/windows_launch.py'
+        raise RuntimeError('O2 未安装：请在终端执行 ' + O2_INSTALL_CMD +
+                           '（或让 IT/同事协助安装），安装后重跑 python scripts/invite.py doctor')
+    helper = find_o2_helper(home)
     python = Path(exe).parent.parent/'python.exe'
-    if os.name == 'nt' and helper.is_file() and python.is_file():
+    if os.name == 'nt' and helper and helper.is_file() and python.is_file():
         return [str(python), '-X', 'utf8', str(helper), 'launch', 'webcli']
     return [exe, 'launch', 'webcli']
 
 class Client:
-    def __init__(self, session, tab, command=None, profile=None):
+    def __init__(self, session, tab, command=None, profile=None, prefix=None):
         if not session or not tab:
             raise ValueError('A task-owned --session and --tab are required')
-        self.prefix = launcher(command)
+        self.prefix = list(prefix) if prefix else launcher(command)
         self.session, self.tab, self.profile = session, tab, profile
         self.engine = (ROOT/'scripts/api.js').read_text(encoding='utf-8')
 
@@ -60,6 +166,11 @@ class Client:
         if os.name == 'nt' and len(subprocess.list2cmdline(cmd)) > 30000:
             raise RuntimeError('Command is too large; reduce --group-size or inspect a compact current query')
         return cmd
+
+    def prefix_args(self, args, timeout=90):
+        cmd = self.prefix + (['--profile', self.profile] if self.profile else []) + args
+        return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                              timeout=timeout, shell=False)
 
     def preflight(self, request):
         self.command(request)
@@ -310,12 +421,15 @@ def run(client, directory, snapshot, state, retry_failed=False, resend=False, gr
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=['prepare','run','verify','status'])
-    p.add_argument('--state-dir',required=True);p.add_argument('--session');p.add_argument('--tab')
+    p.add_argument('action',choices=['doctor','prepare','run','verify','status'])
+    p.add_argument('--state-dir');p.add_argument('--session');p.add_argument('--tab')
     p.add_argument('--profile');p.add_argument('--launcher-json');p.add_argument('--expected-count',type=int)
     p.add_argument('--query-file');p.add_argument('--apply',action='store_true');p.add_argument('--retry-failed',action='store_true');p.add_argument('--resend',action='store_true')
     p.add_argument('--group-size',type=int,choices=range(1,5),default=4)
-    a=p.parse_args();directory=Path(a.state_dir).expanduser().resolve()
+    a=p.parse_args()
+    if a.action=='doctor': return doctor(a)
+    if not a.state_dir: p.error('--state-dir is required for this action')
+    directory=Path(a.state_dir).expanduser().resolve()
     if directory==ROOT or ROOT in directory.parents: p.error('Task data must stay outside the public Skill folder')
     if a.action=='run' and not a.apply: p.error('run requires --apply after the user authorizes invitations')
     directory.mkdir(parents=True,exist_ok=True)
