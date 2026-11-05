@@ -8,7 +8,10 @@ from pathlib import Path
 REPO=Path(__file__).resolve().parents[1]
 FORBIDDEN_NAMES=('__pycache__/','.pyc','.pytest_cache/','.venv/','snapshot.json','state.json',
                  'result.json','result.csv','failures.csv','run.lock','.env','.DS_Store')
-FORBIDDEN_CONTENT=re.compile(r'caotong\.888|D:[/\\]caotong|C:[/\\]Users[/\\][A-Za-z0-9_.-]+[/\\]|Miniconda3|:58126',re.I)
+# Markers are concatenated so this test file does not match itself.
+_PERSONAL_MARKERS=('caotong'+'.888','D:'+r'[/\\]'+'caotong','Mini'+'conda3',':'+'58126',
+                   'C:'+r'[/\\]'+'Users'+r'[/\\]'+r'[A-Za-z0-9_.-]+'+r'[/\\]')
+FORBIDDEN_CONTENT=re.compile('|'.join(_PERSONAL_MARKERS),re.I)
 
 class PublishPackageTests(unittest.TestCase):
     @classmethod
