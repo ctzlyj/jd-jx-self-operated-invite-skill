@@ -181,4 +181,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(p.sent),7);self.assertFalse(p.later_stage & set(p.sent))
         self.assertTrue(result['complete'])
 
+    def test_platform_rejected_inflow_counted_on_resend(self):
+        p=FakePlatform(9);s,t=self.prepare(p)
+        p.later_stage={r['spuId'] for r in p.rows[:2]};p.active |= p.later_stage
+        s,t=runner.load_task(self.directory)
+        result=runner.run(p,self.directory,s,t,resend=True)
+        self.assertEqual(result['platformRejected'],2)
+        self.assertTrue(result['complete'])
+
 if __name__=='__main__':unittest.main()

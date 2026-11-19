@@ -323,6 +323,7 @@ def report(directory, snapshot, state, board=None):
               'resent': sum(1 for x in state['items'].values() if x.get('resendCount')),
               'verifiedSpus': state.get('verification', {}).get('count', 0),
               'complete': not any(x['state'] in ('pending','submitting','unknown','rejected') for x in state['items'].values()),
+              'platformRejected': sum(1 for x in state['items'].values() if x.get('inflow')),
               'board': board, 'batches': len(state['batches'])}
     write(directory/'result.json', result)
     fields = ['spuId','venderId','shopId','erp','shopName','productName','state','message']
@@ -365,7 +366,7 @@ def run(client, directory, snapshot, state, retry_failed=False, resend=False, gr
                 for item in items:
                     if item['state'] not in ('accepted','rejected','unknown','inflow','pending'): raise RuntimeError('Invalid receipt state')
                     if item['state']=='inflow':
-                        state['items'][item['spuId']].update(state='existing',msg='Platform: already in later upgrade flow; pool clears on refresh')
+                        state['items'][item['spuId']].update(state='existing',inflow=True,msg='Platform: already in later upgrade flow; pool clears on refresh')
                         returned_ids.add(item['spuId'])
                     elif item['state']=='pending':
                         pass
@@ -403,7 +404,7 @@ def run(client, directory, snapshot, state, retry_failed=False, resend=False, gr
                 item=receipt[0].get('items',[{}])[0]
                 if item.get('spuId')!=r['spuId'] or item.get('state') not in ('accepted','rejected','unknown','inflow','pending'): raise RuntimeError('Invalid single receipt')
                 if item['state']=='inflow':
-                    row.update(state='existing',msg='Platform: already in later upgrade flow; pool clears on refresh')
+                    row.update(state='existing',inflow=True,msg='Platform: already in later upgrade flow; pool clears on refresh')
                 elif item['state']=='pending':
                     row['state']='pending'
                 else:
